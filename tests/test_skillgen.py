@@ -189,11 +189,12 @@ def test_query_heading_is_homed_in_core_stub_only():
     assert "## For /graphify path" not in core_headings
 
 
-def test_eight_references_render_for_claude():
-    """claude renders exactly the eight on-demand fragments from the design."""
+def test_nine_references_render_for_claude():
+    """claude renders exactly the nine on-demand fragments from the design."""
     _, refs = _claude_artifacts()
     assert sorted(refs) == [
         "add-watch.md",
+        "discovery.md",
         "exports.md",
         "extraction-spec.md",
         "github-and-merge.md",
@@ -439,11 +440,12 @@ def test_compact_extraction_hosts_use_the_compact_spec():
         assert "(compact)" not in refs["extraction-spec.md"], f"[{key}] should be verbose"
 
 
-def test_every_split_host_renders_eight_references():
-    """All twelve split hosts render exactly the eight on-demand references."""
+def test_every_split_host_renders_nine_references():
+    """Every split host renders exactly the nine on-demand references."""
     platforms = gen.load_platforms()
     expected = [
         "add-watch.md",
+        "discovery.md",
         "exports.md",
         "extraction-spec.md",
         "github-and-merge.md",
@@ -457,6 +459,21 @@ def test_every_split_host_renders_eight_references():
             continue
         _, refs = _platform_artifacts(key)
         assert sorted(refs) == expected, f"[{key}] reference set drift: {sorted(refs)}"
+
+
+def test_discovery_is_review_gated_and_reuses_add():
+    core, refs = _claude_artifacts()
+    discovery = refs["discovery.md"]
+
+    assert '/graphify discover "<topic>"' in core
+    assert "/graphify collect --approve" in core
+    assert "Candidate interchange format" in discovery
+    assert "Discovery never ingests" in discovery
+    assert "Only an explicit selection authorizes collection" in discovery
+    assert "calls the existing ingest/add implementation" in discovery
+    assert "raw/.graphify-sources.jsonl" in discovery
+    assert "Automatic collection is opt-in" in discovery
+    assert "policy.auto_approve_score" in discovery
 
 
 # --- the aider + devin monoliths -----------------------------------------------

@@ -32,6 +32,9 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify add <url>                                   # fetch URL, save to ./raw, update graph
 /graphify add <url> --author "Name"                   # tag who wrote it
 /graphify add <url> --contributor "Name"              # tag who added it to the corpus
+/graphify discover "<topic>"                          # find, rank, and save a review queue
+/graphify collect --approve "1,3"                     # ingest only explicitly approved candidates
+/graphify schedule run --config graphify-sources.json # scheduled discovery; review-only by default
 /graphify query "<question>"                          # BFS traversal - broad context
 /graphify query "<question>" --dfs                    # DFS - trace a specific path
 /graphify query "<question>" --budget 1500            # cap answer at N tokens
@@ -41,7 +44,7 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 
 ## What graphify is for
 
-Drop any folder of code, docs, papers, images, or video into graphify and get a queryable knowledge graph. Persistent across sessions, honest audit trail (EXTRACTED/INFERRED/AMBIGUOUS), community detection surfaces cross-document connections you wouldn't think to ask about.
+Drop any folder of code, docs, papers, images, or video into graphify and get a queryable knowledge graph. Persistent across sessions, honest audit trail (EXTRACTED/INFERRED/AMBIGUOUS), community detection surfaces cross-document connections you wouldn't think to ask about. For online research, the host agent can discover candidate sources and require review before passing approved URLs to the existing add flow.
 
 ## What You Must Do When Invoked
 
@@ -588,6 +591,12 @@ Both are non-default subcommands. `--update` re-extracts only new or changed fil
 ## For /graphify add and --watch
 
 Neither is part of the default build. When the user runs `/graphify add <url>` to fetch a URL into the corpus, or passes `--watch` to auto-rebuild on file changes, see `references/add-watch.md`.
+
+---
+
+## For /graphify discover
+
+When the user asks to find online sources, use host search when available, save the results as candidate JSON, then run the Python discovery pipeline for validation, ranking, and review. Built-in arXiv, Crossref, and RSS providers are also available. See `references/discovery.md`; never ingest pending candidates without explicit approval. Scheduled discovery is review-only unless the user explicitly configures an automatic approval threshold.
 
 ---
 

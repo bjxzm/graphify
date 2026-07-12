@@ -213,7 +213,14 @@ def _reenter_main() -> None:
 
 
 def dispatch_command(cmd: str) -> None:
-    if cmd == "provider":
+    if cmd in {"discover", "collect", "schedule"}:
+        from graphify.discovery import dispatch_cli as _dispatch_discovery
+        try:
+            _dispatch_discovery(cmd, sys.argv[2:])
+        except Exception as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(1)
+    elif cmd == "provider":
         from graphify.llm import _custom_providers_path, BACKENDS
         import json as _json
         subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
