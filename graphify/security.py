@@ -164,7 +164,7 @@ def _resolve_and_validate(host: str, port: int) -> tuple[int, str]:
     """
     infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
     for family, _type, _proto, _canon, sockaddr in infos:
-        addr = sockaddr[0]
+        addr = str(sockaddr[0])
         try:
             ip = ipaddress.ip_address(addr)
         except ValueError:
@@ -177,55 +177,207 @@ def _resolve_and_validate(host: str, port: int) -> tuple[int, str]:
     raise OSError(f"SSRF blocked: no usable address resolved from '{host}'")
 
 
+def _normalise_host(host: str) -> str:
+    """Return a stable representation for proxy endpoint comparisons."""
+    value = host.strip().strip("[]").rstrip(".").lower()
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError:
+        return value
+
+
+def _is_configured_proxy_endpoint(host: str, port: int) -> bool:
+    """Return True when *host*:*port* exactly matches an OS/env proxy.
+
+    urllib transparently rewrites a request's connection host to the configured
+    proxy. The guard must distinguish that transport endpoint from the still
+    untrusted destination URL.
+    """
+    wanted_host = _normalise_host(host)
+    for name, raw_proxy in urllib.request.getproxies().items():
+        if name.lower() == "no" or not isinstance(raw_proxy, str):
+            continue
+        value = raw_proxy.strip()
+        if not value:
+            continue
+        if "://" not in value:
+            value = f"http://{value}"
+        try:
+            parsed = urllib.parse.urlparse(value)
+            proxy_host = parsed.hostname
+            proxy_port = parsed.port
+        except ValueError:
+            continue
+        if not proxy_host:
+            continue
+        if proxy_port is None:
+            proxy_port = 443 if parsed.scheme.lower() == "https" else 80
+        if _normalise_host(proxy_host) == wanted_host and proxy_port == port:
+            return True
+    return False
+
+
+def _resolve_configured_local_proxy(host: str, port: int) -> tuple[int, str]:
+    """Resolve an explicitly configured loopback proxy and pin its IP.
+
+    Private-network proxies remain blocked. This exception is intentionally
+    limited to loopback endpoints controlled by the local environment.
+    """
+    if not _is_configured_proxy_endpoint(host, port):
+        raise OSError(
+            f"SSRF blocked: '{host}:{port}' is not an explicitly configured proxy"
+        )
+
+    infos = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    usable: list[tuple[int, str]] = []
+    for family, _type, _proto, _canon, sockaddr in infos:
+        addr = str(sockaddr[0])
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if not ip.is_loopback:
+            raise OSError(
+                f"SSRF blocked: configured proxy '{host}:{port}' resolved to "
+                f"non-loopback IP {addr}"
+            )
+        usable.append((family, addr))
+    if usable:
+        return usable[0]
+    raise OSError(f"SSRF blocked: no usable address resolved from proxy '{host}'")
+
+
+def _request_target(req: urllib.request.Request) -> tuple[str, int]:
+    parsed = urllib.parse.urlparse(req.full_url)
+    if not parsed.hostname:
+        raise ValueError(f"URL has no hostname: {req.full_url!r}")
+    port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    return parsed.hostname, port
+
+
+def _guarded_endpoint(
+    host: str,
+    port: int,
+    target_host: str,
+    target_port: int,
+) -> tuple[int, str]:
+    """Validate a direct target or an explicitly configured local proxy hop."""
+    if _is_configured_proxy_endpoint(host, port):
+        # The proxy is only a transport hop; the destination still gets a
+        # fresh connect-time SSRF check.
+        _resolve_and_validate(target_host, target_port)
+        return _resolve_configured_local_proxy(host, port)
+    return _resolve_and_validate(host, port)
+
+
 class _SSRFGuardedHTTPConnection(http.client.HTTPConnection):
-    """HTTPConnection that resolves + validates DNS once, then connects to the
-    exact validated IP (no second resolution = no DNS-rebind TOCTOU)."""
+    """HTTPConnection that pins either a public target or a local proxy IP."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int | None = None,
+        *,
+        target_host: str,
+        target_port: int,
+        **kwargs,
+    ) -> None:
+        super().__init__(host, port=port, **kwargs)
+        self._graphify_target_host = target_host
+        self._graphify_target_port = target_port
+
+    def _guarded_endpoint(self) -> tuple[int, str]:
+        return _guarded_endpoint(
+            self.host,
+            self.port,
+            self._graphify_target_host,
+            self._graphify_target_port,
+        )
 
     def connect(self) -> None:
-        family, ip = _resolve_and_validate(self.host, self.port)
+        _family, ip = self._guarded_endpoint()
         self.sock = socket.create_connection(
             (ip, self.port),
             self.timeout,
-            self.source_address,
+            getattr(self, "source_address", None),
         )
-        if self._tunnel_host:
-            self._tunnel()
+        if getattr(self, "_tunnel_host", None):
+            getattr(self, "_tunnel")()
 
 
 class _SSRFGuardedHTTPSConnection(http.client.HTTPSConnection):
-    """HTTPSConnection variant of _SSRFGuardedHTTPConnection.
+    """HTTPSConnection that validates the destination behind a local proxy."""
 
-    Connects to the validated IP but performs the TLS handshake with
-    server_hostname set to the original hostname so SNI / certificate
-    validation work correctly (validating against the IP would break TLS).
-    """
+    def __init__(
+        self,
+        host: str,
+        port: int | None = None,
+        *,
+        target_host: str,
+        target_port: int,
+        **kwargs,
+    ) -> None:
+        super().__init__(host, port=port, **kwargs)
+        self._graphify_target_host = target_host
+        self._graphify_target_port = target_port
+
+    def _guarded_endpoint(self) -> tuple[int, str]:
+        return _guarded_endpoint(
+            self.host,
+            self.port,
+            self._graphify_target_host,
+            self._graphify_target_port,
+        )
 
     def connect(self) -> None:
-        family, ip = _resolve_and_validate(self.host, self.port)
+        _family, ip = self._guarded_endpoint()
         sock = socket.create_connection(
             (ip, self.port),
             self.timeout,
-            self.source_address,
+            getattr(self, "source_address", None),
         )
-        if self._tunnel_host:
+        if getattr(self, "_tunnel_host", None):
             self.sock = sock
-            self._tunnel()
+            getattr(self, "_tunnel")()
             sock = self.sock
-        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        server_hostname = getattr(self, "_tunnel_host", None) or self._graphify_target_host
+        self.sock = getattr(self, "_context").wrap_socket(
+            sock, server_hostname=server_hostname
+        )
 
 
 class _SSRFGuardedHTTPHandler(urllib.request.HTTPHandler):
     """urllib handler that routes http:// through _SSRFGuardedHTTPConnection."""
 
     def http_open(self, req):
-        return self.do_open(_SSRFGuardedHTTPConnection, req)
+        target_host, target_port = _request_target(req)
+
+        def connection_factory(host, **kwargs):
+            return _SSRFGuardedHTTPConnection(
+                host,
+                target_host=target_host,
+                target_port=target_port,
+                **kwargs,
+            )
+
+        return self.do_open(connection_factory, req)
 
 
 class _SSRFGuardedHTTPSHandler(urllib.request.HTTPSHandler):
     """urllib handler that routes https:// through _SSRFGuardedHTTPSConnection."""
 
     def https_open(self, req):
-        return self.do_open(_SSRFGuardedHTTPSConnection, req)
+        target_host, target_port = _request_target(req)
+
+        def connection_factory(host, **kwargs):
+            return _SSRFGuardedHTTPSConnection(
+                host,
+                target_host=target_host,
+                target_port=target_port,
+                **kwargs,
+            )
+
+        return self.do_open(connection_factory, req)
 
 
 class _NoFileRedirectHandler(urllib.request.HTTPRedirectHandler):
