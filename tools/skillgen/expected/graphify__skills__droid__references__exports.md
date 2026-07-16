@@ -1,6 +1,25 @@
 # graphify reference: extra exports and benchmark
 
-Load this when the user passed one of the export flags (`--wiki`, `--neo4j`, `--neo4j-push`, `--falkordb`, `--falkordb-push`, `--svg`, `--graphml`, `--mcp`), or when the corpus is large enough for the token-reduction benchmark. Each step runs only for its own flag.
+Load this when the user passed one of the export flags (`--excel`, `--wiki`, `--neo4j`, `--neo4j-push`, `--falkordb`, `--falkordb-push`, `--svg`, `--graphml`, `--mcp`), or when the corpus is large enough for the token-reduction benchmark. Each step runs only for its own flag.
+
+### Step 6a - Excel workbook (only if --excel flag)
+
+Run `graphify export excel` after community labels are saved and before Step 9 cleanup. Use `--output PATH.xlsx` only when the user requested a custom location. The default is `graphify-out/graph.xlsx`.
+
+The workbook contains:
+
+- `数据标注`: one row per node using `序号`, `时间`, `主要标签`, `次要标签`, `关联标签`, `内容`.
+- `节点`: node IDs, labels, types, community, degree, source file/location, and description.
+- `关系`: source/target IDs and labels, relation, evidence type, confidence score, weight, and source.
+- `社区`: community names, member counts, cohesion, and member labels.
+- `来源`: deduplicated source inventory with node/relationship counts.
+- `元数据`: generation time, graph size/type, commit, and format note.
+
+Treat every cell as untrusted. The exporter neutralizes formula prefixes, strips illegal XML controls, caps cell length, fails clearly at Excel row limits, preserves date values, and never mutates `graph.json`. If the command reports a missing dependency, install `graphifyy[excel]` and rerun.
+
+```bash
+graphify export excel
+```
 
 ### Step 6b - Wiki (only if --wiki flag)
 

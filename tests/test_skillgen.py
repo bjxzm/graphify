@@ -113,7 +113,7 @@ def test_lean_core_runs_default_pipeline_with_zero_references():
         "#### Part C - Merge AST + semantic into final extraction",
         "### Step 4 - Build graph, cluster, analyze, generate outputs",
         "### Step 5 - Label communities",
-        "### Step 6 - Generate Obsidian vault (opt-in) + HTML",
+        "### Step 6 - Generate optional Excel/Obsidian exports + HTML",
         "### Step 9 - Save manifest, update cost tracker, clean up, and report",
         "## Honesty Rules",
         "graphify export html",
@@ -467,12 +467,14 @@ def test_discovery_is_review_gated_and_reuses_add():
 
     assert '/graphify discover "<topic>"' in core
     assert "/graphify collect --approve" in core
-    assert "Candidate interchange format" in discovery
+    assert "Build the research plan" in discovery
+    assert "extract_identifiers" not in discovery  # user-facing workflow, not implementation detail
+    assert "program -> solicitation -> award -> performer" in discovery
+    assert "query_variant" in discovery
+    assert "evidence_role" in discovery
+    assert "coverage gap" in discovery
     assert "Discovery never ingests" in discovery
-    assert "Only an explicit selection authorizes collection" in discovery
-    assert "calls the existing ingest/add implementation" in discovery
     assert "raw/.graphify-sources.jsonl" in discovery
-    assert "Automatic collection is opt-in" in discovery
     assert "policy.auto_approve_score" in discovery
 
 

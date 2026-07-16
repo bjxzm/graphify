@@ -22,6 +22,18 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from graphify.ingest import ingest
+from graphify.research import (
+    QueryPlan,
+    QuerySpec,
+    build_query_plan,
+    candidate_text,
+    coverage_report,
+    domain_authority,
+    expand_query_plan,
+    extract_identifiers,
+    infer_evidence_role,
+    tokenize,
+)
 from graphify.security import safe_fetch_text
 
 
@@ -100,6 +112,17 @@ class Candidate:
     metadata: dict[str, Any] = field(default_factory=dict)
     local_path: str | None = None
     error: str | None = None
+    query_variant: str = ""
+    query_family: str = "seed"
+    evidence_role: str = "general"
+    identifiers: dict[str, list[str]] = field(default_factory=dict)
+    discovered_from: str | None = None
+    parent_candidate_id: str | None = None
+    authority_score: float = 0.0
+    exact_match_score: float = 0.0
+    coverage_gain: float = 0.0
+    match_reasons: list[str] = field(default_factory=list)
+    access_status: str = "unknown"
 
     def __post_init__(self) -> None:
         self.url = str(self.url).strip()
@@ -108,6 +131,8 @@ class Candidate:
         self.provider = re.sub(r"[^a-z0-9_-]", "", str(self.provider).lower())[:50] or "host"
         self.canonical_url = self.canonical_url or canonicalize_url(self.url)
         self.id = self.id or _candidate_id(self.canonical_url)
+        self.query_family = re.sub(r"[^a-z0-9_-]", "", self.query_family.lower())[:50] or "seed"
+        self.evidence_role = re.sub(r"[^a-z0-9_-]", "", self.evidence_role.lower())[:50] or "general"
         if self.status not in {"pending", "approved", "rejected", "collected", "failed", "duplicate"}:
             raise ValueError(f"invalid candidate status: {self.status!r}")
 
@@ -126,6 +151,15 @@ class Candidate:
             query=str(value.get("query") or query),
             discovered_at=str(value.get("discovered_at") or _now()),
             metadata=dict(value.get("metadata") or {}),
+            query_variant=str(value.get("query_variant") or value.get("query") or query),
+            query_family=str(value.get("query_family") or "seed"),
+            evidence_role=str(value.get("evidence_role") or "general"),
+            identifiers={str(k): [str(x) for x in values]
+                         for k, values in dict(value.get("identifiers") or {}).items()},
+            discovered_from=value.get("discovered_from"),
+            parent_candidate_id=value.get("parent_candidate_id"),
+            match_reasons=[str(x) for x in value.get("match_reasons", [])],
+            access_status=str(value.get("access_status") or "unknown"),
         )
 
 
@@ -140,11 +174,19 @@ class DiscoveryPolicy:
     max_age_days: int | None = None
     auto_approve_score: float | None = None
     max_collect: int = 10
+    domain_caps: dict[str, int] = field(default_factory=dict)
+    role_quotas: dict[str, int] = field(default_factory=dict)
+    profile: str = "auto"
+    max_rounds: int = 2
 
     def __post_init__(self) -> None:
         self.limit = max(1, min(int(self.limit), 100))
         self.max_per_domain = max(1, min(int(self.max_per_domain), 20))
         self.max_collect = max(1, min(int(self.max_collect), 100))
+        self.max_rounds = max(1, min(int(self.max_rounds), 4))
+        self.domain_caps = {str(k).lower().strip("."): max(1, min(int(v), 100))
+                            for k, v in self.domain_caps.items()}
+        self.role_quotas = {str(k): max(0, min(int(v), 100)) for k, v in self.role_quotas.items()}
         if self.auto_approve_score is not None and not 0 <= self.auto_approve_score <= 1:
             raise ValueError("auto_approve_score must be between 0 and 1")
 
@@ -248,17 +290,53 @@ class RssProvider:
 
 
 def _tokens(text: str) -> set[str]:
-    return {x for x in re.findall(r"[\w\u4e00-\u9fff]+", text.lower()) if len(x) > 1}
+    return tokenize(text)
 
 
-def score_candidate(candidate: Candidate, query: str, *, now: datetime | None = None) -> Candidate:
-    q = _tokens(query)
-    text = _tokens(f"{candidate.title} {candidate.summary}")
-    candidate.relevance_score = min(1.0, len(q & text) / max(1, len(q)))
-    completeness = sum(bool(x) for x in (candidate.title, candidate.summary, candidate.author, candidate.published_at)) / 4
-    candidate.quality_score = min(1.0, PROVIDER_QUALITY.get(candidate.provider, 0.55) * 0.75 + completeness * 0.25)
+def score_candidate(candidate: Candidate, query: str, *, now: datetime | None = None,
+                    plan: QueryPlan | None = None) -> Candidate:
+    q = _tokens(" ".join([query] + (plan.aliases if plan else [])))
+    raw_text = candidate_text(candidate)
+    tokens = _tokens(raw_text)
+    candidate.relevance_score = min(1.0, len(q & tokens) / max(1, len(q)))
+    completeness = sum(bool(x) for x in (candidate.title, candidate.summary, candidate.author,
+                                          candidate.published_at)) / 4
+    candidate.quality_score = completeness
+    candidate.evidence_role = infer_evidence_role(candidate)
+    candidate.authority_score = max(PROVIDER_QUALITY.get(candidate.provider, 0.55),
+                                    domain_authority(candidate.canonical_url))
+    for kind, values in extract_identifiers(raw_text).items():
+        bucket = candidate.identifiers.setdefault(kind, [])
+        bucket.extend(value for value in values if value not in bucket)
+    expected_ids = extract_identifiers(query)
+    if plan:
+        for kind, values in plan.identifiers.items():
+            expected_ids.setdefault(kind, []).extend(values)
+    precise_ids = sorted({value for kind, values in candidate.identifiers.items()
+                          for value in values if kind in {"contract", "doi"}
+                          and value in expected_ids.get(kind, [])})
+    metric_matches = sorted({value for kind, values in candidate.identifiers.items()
+                             for value in values if kind in {"frequency", "percentage"}
+                             and value in expected_ids.get(kind, [])})
+    topic_exact = bool(query.strip() and query.strip().strip('"').casefold() in raw_text.casefold())
+    if precise_ids:
+        candidate.exact_match_score = 1.0
+        candidate.match_reasons = [f"exact identifier: {value}" for value in precise_ids]
+    elif topic_exact:
+        candidate.exact_match_score = 0.85
+        candidate.match_reasons = ["exact topic phrase"]
+    elif metric_matches:
+        candidate.exact_match_score = 0.55
+        candidate.match_reasons = [f"exact technical metric: {value}" for value in metric_matches]
+    else:
+        candidate.exact_match_score = 0.0
+        candidate.match_reasons = ([f"query overlap: {candidate.relevance_score:.2f}"]
+                                   if candidate.relevance_score else [])
+    candidate.coverage_gain = 1.0 if plan and candidate.evidence_role in plan.required_roles else 0.2
     published = _parse_date(candidate.published_at)
-    if published is None:
+    if candidate.evidence_role in {"program_source", "solicitation", "award_notice"}:
+        candidate.freshness_score = 1.0
+    elif published is None:
         candidate.freshness_score = 0.5
     else:
         days = max(0, ((now or datetime.now(timezone.utc)) - published).days)
@@ -270,17 +348,21 @@ def score_candidate(candidate: Candidate, query: str, *, now: datetime | None = 
         candidate.quality_issues.append("missing summary")
     if not candidate.published_at:
         candidate.quality_issues.append("unknown publication date")
-    candidate.score = round(0.55 * candidate.relevance_score + 0.3 * candidate.quality_score + 0.15 * candidate.freshness_score, 4)
+    candidate.score = round(0.3 * candidate.relevance_score + 0.25 * candidate.authority_score
+                            + 0.2 * candidate.exact_match_score + 0.15 * candidate.coverage_gain
+                            + 0.05 * candidate.quality_score + 0.05 * candidate.freshness_score, 4)
     return candidate
 
 
-def rank_candidates(candidates: Iterable[Candidate], query: str, policy: DiscoveryPolicy) -> list[Candidate]:
+def rank_candidates(candidates: Iterable[Candidate], query: str, policy: DiscoveryPolicy,
+                    plan: QueryPlan | None = None) -> list[Candidate]:
     deduped: dict[str, Candidate] = {}
     for item in candidates:
         domain = urllib.parse.urlsplit(item.canonical_url).hostname or ""
         if policy.require_https and not item.canonical_url.startswith("https://"):
             continue
-        if policy.allowed_domains and not any(domain == d or domain.endswith("." + d) for d in policy.allowed_domains):
+        if policy.allowed_domains and not any(domain == d or domain.endswith("." + d)
+                                              for d in policy.allowed_domains):
             continue
         if any(domain == d or domain.endswith("." + d) for d in policy.blocked_domains):
             continue
@@ -288,28 +370,51 @@ def rank_candidates(candidates: Iterable[Candidate], query: str, policy: Discove
             published = _parse_date(item.published_at)
             if published and datetime.now(timezone.utc) - published > timedelta(days=policy.max_age_days):
                 continue
-        score_candidate(item, query)
+        score_candidate(item, query, plan=plan)
         old = deduped.get(item.canonical_url)
         if old is None or item.score > old.score:
             deduped[item.canonical_url] = item
     ranked = sorted(deduped.values(), key=lambda c: (-c.score, c.canonical_url))
-    selected, per_domain = [], {}
-    for item in ranked:
+    selected: list[Candidate] = []
+    selected_ids: set[str] = set()
+    per_domain: dict[str, int] = {}
+
+    def cap_for(domain: str) -> int:
+        matches = [(len(suffix), cap) for suffix, cap in policy.domain_caps.items()
+                   if domain == suffix or domain.endswith("." + suffix)]
+        return max(matches)[1] if matches else policy.max_per_domain
+
+    def add(item: Candidate, *, enforce_cap: bool = True) -> bool:
+        if item.id in selected_ids or item.score < policy.min_score or len(selected) >= policy.limit:
+            return False
         domain = urllib.parse.urlsplit(item.canonical_url).hostname or ""
-        if item.score < policy.min_score or per_domain.get(domain, 0) >= policy.max_per_domain:
-            continue
+        if enforce_cap and item.exact_match_score != 1.0 and per_domain.get(domain, 0) >= cap_for(domain):
+            return False
         selected.append(item)
+        selected_ids.add(item.id)
         per_domain[domain] = per_domain.get(domain, 0) + 1
-        if len(selected) >= policy.limit:
-            break
+        return True
+
+    quotas = {role: 1 for role in plan.required_roles} if plan else {}
+    quotas.update(policy.role_quotas)
+    for role, quota in quotas.items():
+        for item in (x for x in ranked if x.evidence_role == role):
+            if sum(x.evidence_role == role for x in selected) >= quota:
+                break
+            add(item, enforce_cap=False)
+    for item in ranked:
+        add(item)
     return selected
 
 
-def save_queue(path: Path, topic: str, candidates: list[Candidate], policy: DiscoveryPolicy) -> Path:
+def save_queue(path: Path, topic: str, candidates: list[Candidate], policy: DiscoveryPolicy,
+               plan: QueryPlan | None = None) -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"schema_version": SCHEMA_VERSION, "topic": topic, "created_at": _now(),
-               "policy": asdict(policy), "candidates": [asdict(c) for c in candidates]}
+               "policy": asdict(policy), "candidates": [asdict(c) for c in candidates],
+               "query_plan": plan.to_dict() if plan else None,
+               "coverage": coverage_report(candidates, plan)}
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     tmp.replace(path)
@@ -333,21 +438,37 @@ def load_queue(path: Path) -> tuple[str, DiscoveryPolicy, list[Candidate], dict[
         for key in ("id", "canonical_url", "discovered_at", "status", "local_path", "error"):
             if key in value:
                 setattr(candidate, key, value[key])
-        for key in ("relevance_score", "quality_score", "freshness_score", "score"):
+        for key in ("relevance_score", "quality_score", "freshness_score", "authority_score",
+                    "exact_match_score", "coverage_gain", "score"):
             setattr(candidate, key, float(value.get(key, 0)))
         candidate.quality_issues = list(value.get("quality_issues") or [])
         candidates.append(candidate)
     return str(payload.get("topic") or ""), DiscoveryPolicy(**payload.get("policy", {})), candidates, payload
 
 
-def render_review(candidates: list[Candidate]) -> str:
-    lines = ["| # | ID | Score | Title | Provider / type | Date | Quality | URL |",
-             "|---:|---|---:|---|---|---|---|---|"]
-    for idx, c in enumerate(candidates, 1):
-        issues = ", ".join(c.quality_issues) or "OK"
-        title = c.title.replace("|", "\\|")
-        lines.append(f"| {idx} | `{c.id}` | {c.score:.3f} | {title} | {c.provider} / {c.source_type} | {c.published_at or 'unknown'} | {issues} | {c.canonical_url} |")
-    lines += ["", "Review required: use `graphify collect --approve 1,3` or `--approve-all`. Nothing has been ingested yet."]
+def render_review(candidates: list[Candidate], plan: QueryPlan | None = None) -> str:
+    lines: list[str] = []
+    coverage = coverage_report(candidates, plan)
+    if coverage:
+        lines += ["Evidence coverage:", "", "| Role | Found / required | Gap |", "|---|---:|---|"]
+        for role, status in coverage.items():
+            lines.append(f"| {role} | {status['found']} / {status['required']} | "
+                         f"{'YES' if status['gap'] else 'no'} |")
+        lines.append("")
+    lines += ["| # | ID | Score | Role | Title | Match / discovery path | Quality | URL |",
+              "|---:|---|---:|---|---|---|---|---|"]
+    for idx, candidate in enumerate(candidates, 1):
+        issues = ", ".join(candidate.quality_issues) or "OK"
+        title = candidate.title.replace("|", "\\|")
+        reasons = "; ".join(candidate.match_reasons) or "metadata match"
+        path = candidate.query_variant or candidate.query
+        if candidate.parent_candidate_id:
+            path = f"{candidate.parent_candidate_id} -> {path}"
+        lines.append(f"| {idx} | `{candidate.id}` | {candidate.score:.3f} | "
+                     f"{candidate.evidence_role} | {title} | {reasons}; `{path}` | "
+                     f"{issues} | {candidate.canonical_url} |")
+    lines += ["", "Review required: use `graphify collect --approve 1,3` or `--approve-all`. "
+                    "Nothing has been ingested yet."]
     return "\n".join(lines)
 
 
@@ -389,7 +510,9 @@ def collect_candidates(queue_path: Path, *, approval: str | None = None, approve
                        target_dir: Path = Path("raw"), author: str | None = None,
                        contributor: str | None = None, dry_run: bool = False,
                        selection_mode: str = "manual") -> list[Candidate]:
-    topic, policy, candidates, _ = load_queue(queue_path)
+    topic, policy, candidates, payload = load_queue(queue_path)
+    raw_plan = payload.get("query_plan")
+    plan = QueryPlan.from_mapping(raw_plan) if isinstance(raw_plan, Mapping) else None
     approved = {c.id for c in candidates} if approve_all else parse_approval(approval or "", candidates)
     if len(approved) > policy.max_collect:
         raise ValueError(f"approval exceeds max_collect={policy.max_collect}")
@@ -428,7 +551,7 @@ def collect_candidates(queue_path: Path, *, approval: str | None = None, approve
         with provenance.open("a", encoding="utf-8", newline="\n") as handle:
             for record in records:
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    save_queue(queue_path, topic, candidates, policy)
+    save_queue(queue_path, topic, candidates, policy, plan)
     return candidates
 
 
@@ -440,13 +563,42 @@ PROVIDER_FACTORIES: dict[str, Callable[[Mapping[str, Any]], DiscoveryProvider]] 
 }
 
 
-def discover(topic: str, providers: Iterable[DiscoveryProvider], policy: DiscoveryPolicy) -> list[Candidate]:
+def discover_with_plan(topic: str, providers: Iterable[DiscoveryProvider], policy: DiscoveryPolicy,
+                       *, profile: str | None = None) -> tuple[list[Candidate], QueryPlan]:
     if not topic.strip() or len(topic) > 500:
         raise ValueError("topic must contain 1-500 characters")
+    plan = build_query_plan(topic, profile or policy.profile, max_rounds=policy.max_rounds)
+    provider_list = list(providers)
     found: list[Candidate] = []
-    for provider in providers:
-        found.extend(provider.discover(topic, min(policy.limit * 3, 100)))
-    return rank_candidates(found, topic, policy)
+    specs: list[QuerySpec] = list(plan.queries)
+    host_seen: set[int] = set()
+    for _round in range(plan.max_rounds):
+        if not specs:
+            break
+        for spec in specs:
+            for provider in provider_list:
+                if isinstance(provider, HostFileProvider):
+                    if id(provider) in host_seen:
+                        continue
+                    host_seen.add(id(provider))
+                if provider.name in {"arxiv", "crossref"} and spec.family in {"official", "identifier"}:
+                    continue
+                batch = provider.discover(spec.text, min(policy.limit * 3, 100))
+                for item in batch:
+                    item.query = item.query or topic
+                    item.query_variant = item.query_variant or spec.text
+                    item.query_family = item.query_family if item.query_family != "seed" else spec.family
+                    if item.evidence_role == "general" and spec.evidence_role != "general":
+                        item.evidence_role = spec.evidence_role
+                    item.parent_candidate_id = item.parent_candidate_id or spec.parent_candidate_id
+                    item.discovered_from = item.discovered_from or spec.family
+                found.extend(batch)
+        specs = expand_query_plan(plan, found)
+    return rank_candidates(found, topic, policy, plan), plan
+
+
+def discover(topic: str, providers: Iterable[DiscoveryProvider], policy: DiscoveryPolicy) -> list[Candidate]:
+    return discover_with_plan(topic, providers, policy)[0]
 
 
 def _schedule_state_path(config_path: Path) -> Path:
@@ -478,10 +630,10 @@ def run_schedule(config_path: Path, *, force: bool = False, now: datetime | None
             raw_policy = dict(config.get("policy", {}))
             policy = DiscoveryPolicy(**raw_policy)
             providers = [PROVIDER_FACTORIES[p["type"]](p) for p in config.get("providers", [])]
-            candidates = discover(topic, providers, policy)
+            candidates, plan = discover_with_plan(topic, providers, policy)
             slug = hashlib.sha256(topic.encode("utf-8")).hexdigest()[:12]
             queue = output_dir / f"{slug}.json"
-            save_queue(queue, topic, candidates, policy)
+            save_queue(queue, topic, candidates, policy, plan)
             approved = [c for c in candidates if policy.auto_approve_score is not None and c.score >= policy.auto_approve_score]
             if approved:
                 results = collect_candidates(queue, approval=",".join(c.id for c in approved[:policy.max_collect]),
@@ -517,13 +669,38 @@ def dispatch_cli(command: str, argv: list[str]) -> None:
         p.add_argument("--limit", type=int, default=10)
         p.add_argument("--min-score", type=float, default=0.0)
         p.add_argument("--max-per-domain", type=int, default=3)
+        p.add_argument("--domain-cap", action="append", default=[], metavar="DOMAIN=N")
+        p.add_argument("--role-quota", action="append", default=[], metavar="ROLE=N")
+        p.add_argument("--profile", default="auto", choices=["auto", "general", "government-program"])
+        p.add_argument("--max-rounds", type=int, default=2)
+        p.add_argument("--show-plan", action="store_true")
+        p.add_argument("--plan-only", action="store_true")
         p.add_argument("--out", default="graphify-out/discovery/candidates.json")
         p.add_argument("--json", action="store_true")
         opts = p.parse_args(argv)
-        policy = DiscoveryPolicy(limit=opts.limit, min_score=opts.min_score, max_per_domain=opts.max_per_domain)
-        candidates = discover(opts.topic, _providers_from_args(opts), policy)
-        out = save_queue(Path(opts.out), opts.topic, candidates, policy)
-        print(json.dumps([asdict(c) for c in candidates], indent=2, ensure_ascii=False) if opts.json else render_review(candidates))
+        def pairs(values: list[str]) -> dict[str, int]:
+            result = {}
+            for value in values:
+                key, sep, number = value.rpartition("=")
+                if not sep or not key:
+                    raise ValueError(f"expected NAME=N, got {value!r}")
+                result[key] = int(number)
+            return result
+        policy = DiscoveryPolicy(limit=opts.limit, min_score=opts.min_score,
+                                 max_per_domain=opts.max_per_domain,
+                                 domain_caps=pairs(opts.domain_cap), role_quotas=pairs(opts.role_quota),
+                                 profile=opts.profile, max_rounds=opts.max_rounds)
+        if opts.plan_only:
+            print(json.dumps(build_query_plan(opts.topic, opts.profile,
+                                              max_rounds=opts.max_rounds).to_dict(),
+                             indent=2, ensure_ascii=False))
+            return
+        candidates, plan = discover_with_plan(opts.topic, _providers_from_args(opts), policy)
+        out = save_queue(Path(opts.out), opts.topic, candidates, policy, plan)
+        if opts.show_plan:
+            print(json.dumps(plan.to_dict(), indent=2, ensure_ascii=False))
+        print(json.dumps([asdict(c) for c in candidates], indent=2, ensure_ascii=False)
+              if opts.json else render_review(candidates, plan))
         print(f"\nCandidate queue: {out}")
     elif command == "collect":
         p = argparse.ArgumentParser(prog="graphify collect")

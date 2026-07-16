@@ -227,6 +227,8 @@ _HOOKS_TARGET = {
 # heading was consolidated on purpose and its content is covered elsewhere."
 SHARED_INTRO_ALLOWLIST: frozenset[str] = frozenset({
     "## What graphify is for",  # lean intro; v8 hosts had verbose intro prose, no heading.
+    # Step 6 now names the optional Excel export added after the pinned v8 baseline.
+    "### Step 6 - Generate Obsidian vault (opt-in) + HTML",
 })
 
 _CONSOLIDATION_ALLOWLIST: dict[str, frozenset[str]] = {
@@ -889,6 +891,24 @@ def _is_obsidian_usage_comment_line(line: str) -> bool:
     return "# full pipeline on current directory" in line
 
 
+def _is_excel_export_feature_line(line: str) -> bool:
+    """Whether a monolith diff belongs to the optional Excel export feature.
+
+    The pinned v8 bodies predate ``--excel``. Both the removed Step 6 wording and
+    the new usage, instructions, and conditional output line are intentional.
+    """
+    stripped = line.strip()
+    return (
+        stripped.startswith("/graphify <path> --excel")
+        or "Step 6 - Generate Obsidian vault (opt-in) + HTML" in stripped
+        or "Step 6 - Generate optional Excel/Obsidian exports + HTML" in stripped
+        or (stripped.startswith("**Generate HTML always**") and "Obsidian" in stripped)
+        or stripped.startswith("If `--excel` was given, run `graphify export excel`")
+        or (stripped.startswith("Tell the user (") and ("Excel line" in stripped or "obsidian line" in stripped))
+        or stripped.startswith("graph.xlsx            - labeled tables + provenance")
+    )
+
+
 def _is_uv_from_interpreter_fix_line(line: str) -> bool:
     """Whether a line is part of the uv interpreter-detection fix (#1735).
 
@@ -935,6 +955,7 @@ _SANCTIONED_MONOLITH_DIFFS = (
     _is_no_api_key_fix_line,
     _is_shebang_allowlist_fix_line,
     _is_obsidian_usage_comment_line,
+    _is_excel_export_feature_line,
     _is_uv_from_interpreter_fix_line,
     _is_semantic_cache_scope_fix_line,
 )

@@ -1527,12 +1527,13 @@ def dispatch_command(cmd: str) -> None:
 
     elif cmd == "export":
         subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
-        if subcmd not in ("html", "callflow-html", "obsidian", "wiki", "svg", "graphml", "neo4j", "falkordb"):
+        if subcmd not in ("html", "callflow-html", "obsidian", "excel", "wiki", "svg", "graphml", "neo4j", "falkordb"):
             print("Usage: graphify export <format>", file=sys.stderr)
             print("  html      [--graph PATH] [--labels PATH] [--node-limit N] [--no-viz]", file=sys.stderr)
             print("  callflow-html [GRAPH|DIR] [--graph PATH] [--labels PATH] [--report PATH] [--sections PATH] [--output HTML]", file=sys.stderr)
             print("            [--lang auto|zh-CN|en] [--max-sections N] [--diagram-scale N]", file=sys.stderr)
             print("  obsidian  [--graph PATH] [--labels PATH] [--dir PATH]", file=sys.stderr)
+            print("  excel     [--graph PATH] [--labels PATH] [--output XLSX]", file=sys.stderr)
             print("  wiki      [--graph PATH] [--labels PATH]", file=sys.stderr)
             print("  svg       [--graph PATH] [--labels PATH]", file=sys.stderr)
             print("  graphml   [--graph PATH]", file=sys.stderr)
@@ -1552,6 +1553,7 @@ def dispatch_command(cmd: str) -> None:
         report_path_explicit = False
         sections_path: Path | None = None
         callflow_output: Path | None = None
+        excel_output: Path | None = None
         callflow_lang = "auto"
         callflow_max_sections = 15
         callflow_diagram_scale = 1.0
@@ -1591,9 +1593,13 @@ def dispatch_command(cmd: str) -> None:
             elif a == "--sections" and i + 1 < len(args):
                 sections_path = Path(args[i + 1]); i += 2
             elif a == "--output" and i + 1 < len(args):
-                callflow_output = Path(args[i + 1]).expanduser()
-                if not callflow_output.is_absolute():
-                    callflow_output = Path.cwd() / callflow_output
+                requested_output = Path(args[i + 1]).expanduser()
+                if not requested_output.is_absolute():
+                    requested_output = Path.cwd() / requested_output
+                if subcmd == "excel":
+                    excel_output = requested_output
+                else:
+                    callflow_output = requested_output
                 i += 2
             elif a == "--lang" and i + 1 < len(args):
                 callflow_lang = args[i + 1]; i += 2
@@ -1774,6 +1780,26 @@ def dispatch_command(cmd: str) -> None:
                        community_labels=labels or None)
             print(f"Canvas: {obsidian_dir}/graph.canvas")
             print(f"Open {obsidian_dir}/ as a vault in Obsidian.")
+
+        elif subcmd == "excel":
+            from graphify.exporters.excel import to_excel as _to_excel
+            target = excel_output or (out_dir / "graph.xlsx")
+            try:
+                counts = _to_excel(
+                    G,
+                    communities,
+                    str(target),
+                    community_labels=labels or None,
+                    cohesion=cohesion or None,
+                )
+            except (ImportError, ValueError) as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            print(
+                f"graph.xlsx written: {target} "
+                f"({counts['nodes']} nodes, {counts['relationships']} relationships, "
+                f"{counts['sources']} sources)"
+            )
 
         elif subcmd == "wiki":
             from graphify.wiki import to_wiki as _to_wiki
