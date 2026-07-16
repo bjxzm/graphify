@@ -99,6 +99,48 @@ def test_to_graphml_tolerates_none_attribute_values():
         content = out.read_text()
         assert "<graphml" in content
 
+def test_to_graphml_tolerates_dict_and_list_attribute_values():
+    """nx.write_graphml only accepts scalars; a dict/list attribute (per-node
+    metadata, or the graph-level hyperedges list) used to crash the whole export.
+    to_graphml must JSON-serialize them across graph/node/edge scopes (#1831)."""
+    import networkx as nx
+    G = make_graph()
+    communities = cluster(G)
+    a_node = next(iter(G.nodes()))
+    G.nodes[a_node]["metadata"] = {"kind": "file", "size": 12}
+    G.nodes[a_node]["tags"] = ["x", "y"]
+    if G.number_of_edges():
+        u, v = next(iter(G.edges()))
+        G.edges[u, v]["ctx"] = {"k": "v"}
+    G.graph["hyperedges"] = [{"nodes": [a_node], "label": "h"}]
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "graph.graphml"
+        to_graphml(G, communities, str(out))  # must not raise
+        H = nx.read_graphml(str(out))
+        assert json.loads(H.nodes[a_node]["metadata"]) == {"kind": "file", "size": 12}
+        assert json.loads(H.nodes[a_node]["tags"]) == ["x", "y"]
+        assert json.loads(H.graph["hyperedges"]) == [{"nodes": [a_node], "label": "h"}]
+        assert not (Path(tmp) / "graph.graphml.tmp").exists()
+
+
+def test_to_graphml_preserves_native_scalar_types():
+    """Coercion must leave GraphML-native scalars (int/float/bool/str) untouched,
+    only stringifying non-scalars (#1831)."""
+    import networkx as nx
+    G = nx.Graph()
+    G.add_node("a", count=3, ratio=0.5, flag=True, name="x")
+    G.add_node("b")
+    G.add_edge("a", "b")
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "g.graphml"
+        to_graphml(G, {0: ["a", "b"]}, str(out))
+        H = nx.read_graphml(str(out))
+        assert H.nodes["a"]["count"] == 3
+        assert H.nodes["a"]["ratio"] == 0.5
+        assert H.nodes["a"]["flag"] is True
+        assert H.nodes["a"]["name"] == "x"
+
+
 def test_to_html_creates_file():
     G = make_graph()
     communities = cluster(G)
@@ -115,6 +157,27 @@ def test_to_html_contains_visjs():
         to_html(G, communities, str(out))
         content = out.read_text()
         assert "vis-network" in content
+
+
+def test_to_html_neighbor_links_have_no_inline_onclick_xss():
+    """#1838: neighbor links dropped an unescaped JSON.stringify(nid) into a
+    quoted inline onclick — which broke every link (the value's own quotes
+    truncated the attribute) and let a node id/label containing a double-quote
+    (from a document or a scraped `graphify add` URL) inject a live event handler
+    into the local report (stored XSS). The template must instead carry the id in
+    an escaped data attribute and dispatch via one delegated listener."""
+    G = make_graph()
+    communities = cluster(G)
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "graph.html"
+        to_html(G, communities, str(out))
+        html = out.read_text()
+    # The vulnerable inline handler is gone entirely...
+    assert 'onclick="focusNode(' not in html
+    assert "JSON.stringify(nid)" not in html
+    # ...replaced by an escaped data attribute + a single delegated listener.
+    assert 'data-nid="${esc(nid)}"' in html
+    assert "closest('.neighbor-link')" in html
 
 
 def test_to_html_pins_visjs_version_with_sri():
